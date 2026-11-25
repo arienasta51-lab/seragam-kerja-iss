@@ -12,6 +12,8 @@
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <!-- Lucide Icons -->
     <script src="https://unpkg.com/lucide@latest"></script>
+    <!-- Supabase JS v2 -->
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
     <script>
         tailwind.config = {
             theme: {
@@ -231,7 +233,13 @@
                         <i data-lucide="shirt" class="w-6 h-6"></i>
                     </div>
                     <div>
-                        <h1 class="text-lg sm:text-xl font-bold text-slate-900 tracking-tight leading-tight">Pendataan Seragam Kerja</h1>
+                        <div class="flex items-center gap-2 flex-wrap">
+                            <h1 class="text-lg sm:text-xl font-bold text-slate-900 tracking-tight leading-tight">Pendataan Seragam Kerja</h1>
+                            <span id="realtime-status-badge" class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-amber-50 text-amber-700 border border-amber-200">
+                                <span class="w-2 h-2 rounded-full bg-amber-500"></span>
+                                <span id="realtime-status-text">Mode Lokal</span>
+                            </span>
+                        </div>
                         <p class="text-xs text-slate-500">General Affairs & Human Resources Portal</p>
                     </div>
                 </div>
@@ -622,7 +630,7 @@
                     <div class="flex flex-col md:flex-row md:items-center justify-between gap-4">
                         <div>
                             <h3 class="text-base sm:text-lg font-bold text-slate-900">Rekapitulasi Ukuran Seragam</h3>
-                            <p class="text-xs text-slate-500">Data tersimpan otomatis di browser (localStorage) dan siap diekspor ke Excel.</p>
+                            <p id="rekap-subtitle" class="text-xs text-slate-500">Tersinkronisasi realtime dengan Supabase dan siap diekspor ke Excel.</p>
                         </div>
 
                         <div class="flex flex-wrap items-center gap-2.5">
@@ -737,12 +745,17 @@
     <footer class="bg-white border-t border-slate-200 py-5 mt-auto">
         <div class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-500">
             <p>&copy; 2026 Sistem Pendataan Ukuran Seragam Kerja Karyawan.</p>
-            <p>Data tersimpan secara lokal pada perangkat Anda.</p>
+            <p id="footer-sync-note">Sinkronisasi realtime via Supabase.</p>
         </div>
     </footer>
 
     <!-- Application Logic -->
     <script>
+        // Konfigurasi Supabase
+        const SUPABASE_URL = 'https://coyhsbkvbhmjkfvuqakd.supabase.co'; // Contoh: https://xxxxxxxxxxxx.supabase.co
+        const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_Egp9i_0JRphgoZ3EGUjwxA_VT9Dp8sr';
+        const SUPABASE_TABLE = 'uniform_records';
+
         // Key penyimpanan localStorage & sessionStorage
         const STORAGE_KEY = 'pendataan_seragam_kerja_v1';
         const AUTH_SESSION_KEY = 'rekap_seragam_auth_v1';
@@ -811,6 +824,157 @@
         // State Aplikasi
         let uniformRecords = [];
         let confirmCallback = null;
+        let supabaseClient = null;
+        let realtimeChannel = null;
+        let isRealtimeConnected = false;
+
+        // Mapping objek aplikasi <-> kolom database Supabase
+        function toDbRow(record) {
+            return {
+                id: record.id,
+                nama: record.nama,
+                nik: record.nik,
+                bisnis_unit: record.bisnisUnit,
+                lokasi_kerja: record.lokasiKerja,
+                jabatan: record.jabatan,
+                ukuran_baju: record.ukuranBaju,
+                ukuran_celana: record.ukuranCelana,
+                ukuran_blazer: record.ukuranBlazer,
+                ukuran_sepatu: record.ukuranSepatu,
+                catatan: record.catatan,
+                waktu_input: record.waktuInput
+            };
+        }
+
+        function fromDbRow(row) {
+            return {
+                id: String(row.id),
+                nama: row.nama || '',
+                nik: row.nik || '',
+                bisnisUnit: row.bisnis_unit ?? row.bisnisUnit ?? '',
+                lokasiKerja: row.lokasi_kerja ?? row.lokasiKerja ?? '',
+                jabatan: row.jabatan || '',
+                ukuranBaju: row.ukuran_baju ?? row.ukuranBaju ?? '',
+                ukuranCelana: row.ukuran_celana ?? row.ukuranCelana ?? '',
+                ukuranBlazer: row.ukuran_blazer ?? row.ukuranBlazer ?? '-',
+                ukuranSepatu: row.ukuran_sepatu ?? row.ukuranSepatu ?? '-',
+                catatan: row.catatan || '-',
+                waktuInput: row.waktu_input ?? row.waktuInput ?? '-'
+            };
+        }
+
+        // Perbarui indikator status realtime di header
+        function setRealtimeStatus(state, label) {
+            const badge = document.getElementById('realtime-status-badge');
+            const text = document.getElementById('realtime-status-text');
+            const subtitle = document.getElementById('rekap-subtitle');
+            const footerNote = document.getElementById('footer-sync-note');
+            if (!badge || !text) return;
+
+            let badgeClass = 'bg-amber-50 text-amber-700 border-amber-200';
+            let dotClass = 'bg-amber-500';
+            isRealtimeConnected = false;
+
+            if (state === 'live') {
+                badgeClass = 'bg-emerald-50 text-emerald-700 border-emerald-200';
+                dotClass = 'bg-emerald-500 animate-pulse';
+                isRealtimeConnected = true;
+            } else if (state === 'error') {
+                badgeClass = 'bg-rose-50 text-rose-700 border-rose-200';
+                dotClass = 'bg-rose-500';
+            }
+
+            badge.className = `inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-semibold border ${badgeClass}`;
+            badge.innerHTML = `<span class="w-2 h-2 rounded-full ${dotClass}"></span><span>${escapeHTML(label)}</span>`;
+
+            if (subtitle) {
+                subtitle.textContent = isRealtimeConnected
+                    ? 'Tersinkronisasi realtime dengan Supabase dan siap diekspor ke Excel.'
+                    : 'Mode lokal aktif (atur SUPABASE_URL untuk sinkronisasi realtime Supabase).';
+            }
+            if (footerNote) {
+                footerNote.textContent = isRealtimeConnected
+                    ? 'Terhubung realtime ke Supabase.'
+                    : 'Data tersimpan secara lokal pada perangkat Anda.';
+            }
+        }
+
+        // Inisialisasi Supabase & subscribe perubahan realtime
+        async function initSupabaseRealtime() {
+            const hasValidUrl = SUPABASE_URL && !SUPABASE_URL.includes('GANTI_DENGAN_PROJECT_URL_ANDA') && SUPABASE_URL.startsWith('https://');
+            if (!hasValidUrl || !window.supabase) {
+                setRealtimeStatus('local', 'Mode Lokal');
+                return;
+            }
+
+            try {
+                supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
+                    realtime: { params: { eventsPerSecond: 10 } }
+                });
+
+                const { data, error } = await supabaseClient
+                    .from(SUPABASE_TABLE)
+                    .select('*')
+                    .order('waktu_input', { ascending: false });
+
+                if (error) {
+                    console.error('Supabase fetch error:', error);
+                    setRealtimeStatus('error', 'Supabase Error');
+                    showToast(`Koneksi Supabase gagal: ${error.message}. Menggunakan data lokal.`, 'error');
+                    return;
+                }
+
+                uniformRecords = (data || []).map(fromDbRow);
+                saveLocalCache();
+                updateUI();
+
+                realtimeChannel = supabaseClient
+                    .channel('public:' + SUPABASE_TABLE)
+                    .on(
+                        'postgres_changes',
+                        { event: '*', schema: 'public', table: SUPABASE_TABLE },
+                        (payload) => {
+                            if (payload.eventType === 'INSERT') {
+                                const incoming = fromDbRow(payload.new);
+                                const idx = uniformRecords.findIndex(r => r.id === incoming.id || r.nik.toLowerCase() === incoming.nik.toLowerCase());
+                                if (idx >= 0) {
+                                    uniformRecords[idx] = incoming;
+                                } else {
+                                    uniformRecords.unshift(incoming);
+                                }
+                                saveLocalCache();
+                                updateUI();
+                                showToast(`Data baru masuk realtime: ${incoming.nama}`, 'info');
+                            } else if (payload.eventType === 'UPDATE') {
+                                const updated = fromDbRow(payload.new);
+                                const idx = uniformRecords.findIndex(r => r.id === updated.id);
+                                if (idx >= 0) {
+                                    uniformRecords[idx] = updated;
+                                } else {
+                                    uniformRecords.unshift(updated);
+                                }
+                                saveLocalCache();
+                                updateUI();
+                            } else if (payload.eventType === 'DELETE') {
+                                const deletedId = String(payload.old?.id ?? '');
+                                uniformRecords = uniformRecords.filter(r => r.id !== deletedId);
+                                saveLocalCache();
+                                updateUI();
+                            }
+                        }
+                    )
+                    .subscribe((status) => {
+                        if (status === 'SUBSCRIBED') {
+                            setRealtimeStatus('live', 'Realtime Aktif');
+                        } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+                            setRealtimeStatus('error', 'Realtime Terputus');
+                        }
+                    });
+            } catch (err) {
+                console.error('Supabase init exception:', err);
+                setRealtimeStatus('error', 'Supabase Error');
+            }
+        }
 
         // Inisialisasi saat DOM siap
         document.addEventListener('DOMContentLoaded', () => {
@@ -818,6 +982,7 @@
             loadData();
             updateAuthUI();
             updateUI();
+            initSupabaseRealtime();
 
             // Event Listener Submit Form
             document.getElementById('uniform-form').addEventListener('submit', handleFormSubmit);
@@ -914,9 +1079,8 @@
             try {
                 const raw = localStorage.getItem(STORAGE_KEY);
                 if (raw === null) {
-                    // Pertama kali dibuka, isi dengan dummy data
                     uniformRecords = [...INITIAL_DUMMY_DATA];
-                    saveData();
+                    saveLocalCache();
                 } else {
                     uniformRecords = JSON.parse(raw) || [];
                 }
@@ -926,8 +1090,8 @@
             }
         }
 
-        // Simpan data ke localStorage
-        function saveData() {
+        // Simpan cache lokal & perbarui UI
+        function saveLocalCache() {
             try {
                 localStorage.setItem(STORAGE_KEY, JSON.stringify(uniformRecords));
                 updateUI();
@@ -936,10 +1100,30 @@
             }
         }
 
+        // Simpan / upsert record ke Supabase jika terhubung
+        async function upsertRecordToSupabase(record) {
+            if (!supabaseClient) return false;
+            const { error } = await supabaseClient
+                .from(SUPABASE_TABLE)
+                .upsert(toDbRow(record), { onConflict: 'id' });
+
+            if (error) {
+                console.error('Supabase upsert error:', error);
+                showToast(`Gagal sinkron ke Supabase: ${error.message}`, 'error');
+                return false;
+            }
+            return true;
+        }
+
         // Pulihkan dummy data jika kosong
-        function restoreDummyData() {
+        async function restoreDummyData() {
             uniformRecords = [...INITIAL_DUMMY_DATA];
-            saveData();
+            saveLocalCache();
+            if (supabaseClient) {
+                for (const item of INITIAL_DUMMY_DATA) {
+                    await upsertRecordToSupabase(item);
+                }
+            }
             showToast('Data contoh berhasil dimuat ulang.', 'success');
         }
 
@@ -988,7 +1172,7 @@
         }
 
         // Validasi & Submit Form
-        function handleFormSubmit(e) {
+        async function handleFormSubmit(e) {
             e.preventDefault();
 
             const nama = document.getElementById('nama').value.trim();
@@ -1029,7 +1213,6 @@
                 }
             }
 
-            // Cek duplikasi NIK (opsional: timpa atau peringatkan, di sini kita perbarui jika NIK sama atau tambah baru)
             const existingIndex = uniformRecords.findIndex(item => item.nik.toLowerCase() === nik.toLowerCase());
             
             const now = new Date();
@@ -1052,13 +1235,16 @@
 
             if (existingIndex >= 0) {
                 uniformRecords[existingIndex] = newRecord;
+                saveLocalCache();
+                await upsertRecordToSupabase(newRecord);
                 showToast(`Data NIK ${nik} (${nama}) berhasil diperbarui!`, 'success');
             } else {
                 uniformRecords.unshift(newRecord);
+                saveLocalCache();
+                await upsertRecordToSupabase(newRecord);
                 showToast(`Data seragam atas nama ${nama} berhasil disimpan!`, 'success');
             }
 
-            saveData();
             resetForm();
         }
 
@@ -1242,9 +1428,16 @@
             openConfirmModal(
                 'Hapus Data Karyawan',
                 `Apakah Anda yakin ingin menghapus data ukuran seragam atas nama "${nama}"?`,
-                () => {
+                async () => {
                     uniformRecords = uniformRecords.filter(r => r.id !== id);
-                    saveData();
+                    saveLocalCache();
+                    if (supabaseClient) {
+                        const { error } = await supabaseClient.from(SUPABASE_TABLE).delete().eq('id', id);
+                        if (error) {
+                            showToast(`Gagal menghapus di Supabase: ${error.message}`, 'error');
+                            return;
+                        }
+                    }
                     showToast('Data berhasil dihapus.', 'success');
                 }
             );
@@ -1259,9 +1452,16 @@
             openConfirmModal(
                 'Hapus Seluruh Data',
                 `Tindakan ini akan menghapus semua (${uniformRecords.length}) data ukuran seragam yang tersimpan. Lanjutkan?`,
-                () => {
+                async () => {
                     uniformRecords = [];
-                    saveData();
+                    saveLocalCache();
+                    if (supabaseClient) {
+                        const { error } = await supabaseClient.from(SUPABASE_TABLE).delete().neq('id', '');
+                        if (error) {
+                            showToast(`Gagal menghapus semua di Supabase: ${error.message}`, 'error');
+                            return;
+                        }
+                    }
                     showToast('Seluruh data berhasil dikosongkan.', 'success');
                 }
             );
@@ -1304,7 +1504,6 @@
                 item.waktuInput || '-'
             ]);
 
-            // Escape CSV values
             const escapeCSV = (val) => {
                 const str = String(val ?? '');
                 if (str.includes(',') || str.includes('"') || str.includes('\n')) {
@@ -1318,7 +1517,6 @@
                 ...rows.map(r => r.map(escapeCSV).join(','))
             ].join('\n');
 
-            // Tambahkan UTF-8 BOM agar Excel membaca kolom & karakter dengan rapi
             const blob = new Blob(['\uFEFF' + csvContent], { type: 'text/csv;charset=utf-8;' });
             const url = URL.createObjectURL(blob);
             const link = document.createElement('a');
